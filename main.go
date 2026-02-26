@@ -2,19 +2,15 @@ package main
 
 import (
 	"bytes"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
-
-	"github.com/joho/godotenv"
-	_ "github.com/lib/pq" // PostgreSQL driver
+	"time"
 )
-
-var pool *sql.DB // Database connection pool.
 
 func getEnvWithDefault(key, defaultValue string) string {
 	value := os.Getenv(key)
@@ -22,6 +18,37 @@ func getEnvWithDefault(key, defaultValue string) string {
 		return defaultValue
 	}
 	return value
+}
+
+// pixmeClient wraps http.Client with the internal API key header for pixme-api requests.
+type pixmeClient struct {
+	client *http.Client
+	apiKey string
+}
+
+func (c *pixmeClient) Get(url string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.apiKey != "" {
+		req.Header.Set("X-Internal-Key", c.apiKey)
+	}
+	return c.client.Do(req)
+}
+
+func (c *pixmeClient) Post(url, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPost, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if c.apiKey != "" {
+		req.Header.Set("X-Internal-Key", c.apiKey)
+	}
+	return c.client.Do(req)
 }
 
 type ImageApiResponse struct {
@@ -106,8 +133,8 @@ func extractName(path string) string {
 	return ""
 }
 
-func getImageList(pixmeUri string, offset int) (ImageApiResponse, error) {
-	resp, err := http.Get(pixmeUri + "/api/images/?offset=" + fmt.Sprint(offset) + "&limit=100")
+func getImageList(client *pixmeClient, pixmeUri string, offset int) (ImageApiResponse, error) {
+	resp, err := client.Get(pixmeUri + "/api/images/?offset=" + fmt.Sprint(offset) + "&limit=100")
 	if err != nil {
 		return ImageApiResponse{}, fmt.Errorf("failed to get image list: %w", err)
 	}
@@ -127,38 +154,61 @@ func getImageList(pixmeUri string, offset int) (ImageApiResponse, error) {
 func main() {
 
 	// Load configuration from environment variables.
-	// load from .env file if it exists
-	_ = godotenv.Load()
 	deepfaceUri := getEnvWithDefault("DEEPFACE_URI", "http://deepface.pixme.svc.cluster.local:5000")
 	pixmeUri := getEnvWithDefault("PIXME_URI", "http://pixme.pixme.svc.cluster.local:8080")
+	imageBaseUri := getEnvWithDefault("IMAGE_BASE_URI", "http://pixme-static.pixme.svc.cluster.local:80")
+	internalAPIKey := getEnvWithDefault("INTERNAL_API_KEY", "")
+
+	client := &pixmeClient{
+		client: &http.Client{Timeout: 30 * time.Second},
+		apiKey: internalAPIKey,
+	}
 
 	fmt.Printf("Using DeepFace API at %s\n", deepfaceUri)
 	fmt.Printf("Using Pixme API at %s\n", pixmeUri)
-	// Fetch the initial image list.
-	imageResponse, err := getImageList(pixmeUri, 0)
+	fmt.Printf("Using Image Base URI at %s\n", imageBaseUri)
+	if internalAPIKey != "" {
+		fmt.Println("Internal API key configured")
+	}
+
+	// Retry initial connection with backoff — pod networking may not be ready immediately
+	var imageResponse ImageApiResponse
+	var err error
+	for attempt := 1; attempt <= 5; attempt++ {
+		imageResponse, err = getImageList(client, pixmeUri, 0)
+		if err == nil {
+			break
+		}
+		fmt.Printf("Attempt %d/5 failed: %v\n", attempt, err)
+		if attempt < 5 {
+			delay := time.Duration(attempt) * 2 * time.Second
+			fmt.Printf("Retrying in %v...\n", delay)
+			time.Sleep(delay)
+		}
+	}
 	if err != nil {
-		panic(err)
+		log.Fatalf("Failed to get initial image list after 5 attempts: %v", err)
 	}
 
 	offset := 0
 
 	for offset < imageResponse.Total {
-		imageResponse, err := getImageList(pixmeUri, offset)
+		imageResponse, err := getImageList(client, pixmeUri, offset)
 		if err != nil {
-			panic(err)
+			log.Fatalf("Failed to get image list at offset %d: %v", offset, err)
 		}
 
-		fmt.Printf("Image %+v\n", imageResponse)
-		count, err := handleImageResponse(imageResponse, pixmeUri, deepfaceUri)
+		fmt.Printf("Processing batch at offset %d, count %d, total %d\n", offset, imageResponse.Count, imageResponse.Total)
+		count, err := handleImageResponse(imageResponse, client, pixmeUri, deepfaceUri, imageBaseUri)
 		if err != nil {
-			fmt.Printf("Error handling image response: %s\n", err)
-			panic(err)
+			log.Fatalf("Error handling image response at offset %d: %v", offset, err)
 		}
 		offset += count
 	}
+	fmt.Println("Face recognition job completed successfully")
 }
 
-func handleImageResponse(imageResponse ImageApiResponse, pixmeUri string, deepfaceUri string) (int, error) {
+func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, pixmeUri string, deepfaceUri string, imageBaseUri string) (int, error) {
 	if imageResponse.Count != len(imageResponse.Images) {
 		fmt.Printf("Warning: Count %d does not match number of images %d\n", imageResponse.Count, len(imageResponse.Images))
 		return 0, fmt.Errorf("count does not match number of images")
@@ -170,7 +220,7 @@ func handleImageResponse(imageResponse ImageApiResponse, pixmeUri string, deepfa
 		}
 		//fmt.Printf("Processing image: %s\n", image.Name)
 		deepFaceRequest := DeepFaceRequest{
-			Img:              pixmeUri + image.URI,
+			Img:              imageBaseUri + image.URI,
 			DbPath:           "/mnt/faces",
 			EnforceDetection: false,
 		}
@@ -199,7 +249,7 @@ func handleImageResponse(imageResponse ImageApiResponse, pixmeUri string, deepfa
 			if len(deepFaceResponse.Identity) > 0 {
 				path := deepFaceResponse.Identity["0"]
 				fmt.Printf("Associating identity %s with image %s\n", extractName(path), image.Name)
-				resp, err := http.Post(pixmeUri+"/api/images/"+image.ID+"/people/"+extractName(path), "application/json", nil)
+				resp, err := client.Post(pixmeUri+"/api/images/"+image.ID+"/people/"+extractName(path), "application/json", nil)
 
 				if err != nil {
 					fmt.Printf("Failed to associate identity with image %s: %s\n", image.Name, err)
@@ -225,7 +275,7 @@ func handleImageResponse(imageResponse ImageApiResponse, pixmeUri string, deepfa
 						if err != nil {
 							return 0, fmt.Errorf("failed to marshal Person API request: %s", err)
 						}
-						resp, err := http.Post(pixmeUri+"/api/people/", "application/json", io.NopCloser(bytes.NewReader(jsonData)))
+						resp, err := client.Post(pixmeUri+"/api/people/", "application/json", io.NopCloser(bytes.NewReader(jsonData)))
 						if err != nil {
 							fmt.Printf("Failed to create person %s: %s\n", name, err)
 							return 0, fmt.Errorf("failed to create person %s: %s", name, err)

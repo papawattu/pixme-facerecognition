@@ -23,9 +23,10 @@ ARG BUILD_VERSION
 # Use correct values for cross-compilation
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -ldflags "-X main.BuildVersion=$BUILD_VERSION" -o pixme-facerecognition .
 
-FROM scratch
+FROM alpine:3
+
+RUN apk add --no-cache ca-certificates
 
 COPY --from=build /app/pixme-facerecognition /pixme-facerecognition
 
-EXPOSE 8080
 CMD ["/pixme-facerecognition"]
