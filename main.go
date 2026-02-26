@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -218,9 +219,14 @@ func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, pi
 			fmt.Printf("Warning: Image %s has no URI\n", image.Name)
 			continue
 		}
-		//fmt.Printf("Processing image: %s\n", image.Name)
+		// image.URI comes URL-encoded from the API (e.g. %2Fimages%2F...) — decode it
+		decodedURI, err := url.PathUnescape(image.URI)
+		if err != nil {
+			fmt.Printf("Warning: Failed to decode URI for image %s: %v\n", image.Name, err)
+			decodedURI = image.URI // fallback to raw value
+		}
 		deepFaceRequest := DeepFaceRequest{
-			Img:              imageBaseUri + image.URI,
+			Img:              imageBaseUri + decodedURI,
 			DbPath:           "/mnt/faces",
 			EnforceDetection: false,
 		}
@@ -237,60 +243,56 @@ func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, pi
 		}
 		defer resp.Body.Close()
 
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			fmt.Printf("DeepFace API error for image %s: %s — %s\n", image.Name, resp.Status, string(body))
+			// Skip this image rather than aborting the whole batch
+			continue
+		}
+
 		// Do something with the DeepFace API response
 		var deepFaceResponse DeepFaceResponse
 		if err := json.NewDecoder(resp.Body).Decode(&deepFaceResponse); err != nil {
 			return 0, fmt.Errorf("failed to decode DeepFace API response: %s", err)
 		}
-		if resp.StatusCode != http.StatusOK {
-			fmt.Printf("DeepFace API error: %s\n", resp.Status)
-			return 0, fmt.Errorf("deepface API error: %s", resp.Status)
-		} else {
-			if len(deepFaceResponse.Identity) > 0 {
-				path := deepFaceResponse.Identity["0"]
-				fmt.Printf("Associating identity %s with image %s\n", extractName(path), image.Name)
-				resp, err := client.Post(pixmeUri+"/api/images/"+image.ID+"/people/"+extractName(path), "application/json", nil)
-
-				if err != nil {
-					fmt.Printf("Failed to associate identity with image %s: %s\n", image.Name, err)
-					return 0, fmt.Errorf("failed to associate identity with image %s: %s", image.Name, err)
-				} else {
-					defer resp.Body.Close()
-					if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusConflict {
-						fmt.Printf("Failed to associate identity with image %s: %s\n", image.Name, resp.Status)
-						return 0, fmt.Errorf("failed to associate identity with image %s: %s", image.Name, resp.Status)
-					} else {
-						name := extractName(path)
-						if name == "" {
-							fmt.Printf("Failed to extract name from path %s\n", path)
-							return 0, fmt.Errorf("failed to extract name from path %s", path)
-						}
-						type PersonCreateRequest struct {
-							Name string `json:"name"`
-						}
-						personCreateRequest := PersonCreateRequest{
-							Name: name,
-						}
-						jsonData, err := json.Marshal(personCreateRequest)
-						if err != nil {
-							return 0, fmt.Errorf("failed to marshal Person API request: %s", err)
-						}
-						resp, err := client.Post(pixmeUri+"/api/people/", "application/json", io.NopCloser(bytes.NewReader(jsonData)))
-						if err != nil {
-							fmt.Printf("Failed to create person %s: %s\n", name, err)
-							return 0, fmt.Errorf("failed to create person %s: %s", name, err)
-						} else {
-							defer resp.Body.Close()
-							if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusConflict && resp.StatusCode != http.StatusOK {
-								fmt.Printf("Failed to create person %s: %s\n", name, resp.Status)
-								return 0, fmt.Errorf("failed to create person %s: %s", name, resp.Status)
-							} else {
-								fmt.Printf("Successfully associated identity %s with image %s\n", name, image.Name)
-							}
-						}
-					}
-				}
+		if len(deepFaceResponse.Identity) > 0 {
+			path := deepFaceResponse.Identity["0"]
+			name := extractName(path)
+			if name == "" {
+				fmt.Printf("Failed to extract name from path %s\n", path)
+				return 0, fmt.Errorf("failed to extract name from path %s", path)
 			}
+
+			fmt.Printf("Associating identity %s with image %s\n", name, image.Name)
+			assocResp, err := client.Post(pixmeUri+"/api/images/"+image.ID+"/people/"+name, "application/json", nil)
+			if err != nil {
+				fmt.Printf("Failed to associate identity with image %s: %s\n", image.Name, err)
+				return 0, fmt.Errorf("failed to associate identity with image %s: %s", image.Name, err)
+			}
+			assocResp.Body.Close()
+			if assocResp.StatusCode != http.StatusNoContent && assocResp.StatusCode != http.StatusOK && assocResp.StatusCode != http.StatusConflict {
+				fmt.Printf("Failed to associate identity with image %s: %s\n", image.Name, assocResp.Status)
+				return 0, fmt.Errorf("failed to associate identity with image %s: %s", image.Name, assocResp.Status)
+			}
+
+			type PersonCreateRequest struct {
+				Name string `json:"name"`
+			}
+			personData, err := json.Marshal(PersonCreateRequest{Name: name})
+			if err != nil {
+				return 0, fmt.Errorf("failed to marshal Person API request: %s", err)
+			}
+			personResp, err := client.Post(pixmeUri+"/api/people/", "application/json", io.NopCloser(bytes.NewReader(personData)))
+			if err != nil {
+				fmt.Printf("Failed to create person %s: %s\n", name, err)
+				return 0, fmt.Errorf("failed to create person %s: %s", name, err)
+			}
+			personResp.Body.Close()
+			if personResp.StatusCode != http.StatusCreated && personResp.StatusCode != http.StatusConflict && personResp.StatusCode != http.StatusOK {
+				fmt.Printf("Failed to create person %s: %s\n", name, personResp.Status)
+				return 0, fmt.Errorf("failed to create person %s: %s", name, personResp.Status)
+			}
+			fmt.Printf("Successfully associated identity %s with image %s\n", name, image.Name)
 		}
 	}
 	return imageResponse.Count, nil
