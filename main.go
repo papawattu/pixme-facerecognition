@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -19,6 +20,18 @@ func getEnvWithDefault(key, defaultValue string) string {
 		return defaultValue
 	}
 	return value
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return defaultValue
+	}
+	return parsed
 }
 
 // pixmeClient wraps http.Client with the internal API key header for pixme-api requests.
@@ -140,6 +153,10 @@ func getImageList(client *pixmeClient, pixmeUri string, offset int) (ImageApiRes
 		return ImageApiResponse{}, fmt.Errorf("failed to get image list: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return ImageApiResponse{}, fmt.Errorf("failed to get image list: %s — %s", resp.Status, strings.TrimSpace(string(body)))
+	}
 
 	var imageResponse ImageApiResponse
 	responseBody, err := io.ReadAll(resp.Body)
@@ -150,6 +167,55 @@ func getImageList(client *pixmeClient, pixmeUri string, offset int) (ImageApiRes
 		return ImageApiResponse{}, fmt.Errorf("failed to unmarshal response body: %w", err)
 	}
 	return imageResponse, nil
+}
+
+func getImageListWithRetry(client *pixmeClient, pixmeUri string, offset int, retries int, delay time.Duration) (ImageApiResponse, error) {
+	var lastErr error
+	for attempt := 1; attempt <= retries; attempt++ {
+		resp, err := getImageList(client, pixmeUri, offset)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		fmt.Printf("Attempt %d/%d failed: %v\n", attempt, retries, err)
+		if attempt < retries {
+			fmt.Printf("Retrying in %v...\n", delay)
+			time.Sleep(delay)
+		}
+	}
+	return ImageApiResponse{}, lastErr
+}
+
+func isRetriableStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusRequestTimeout || status >= http.StatusInternalServerError
+}
+
+func postDeepFaceWithRetry(client *http.Client, url string, payload []byte, retries int, delay time.Duration) (*http.Response, error) {
+	var lastErr error
+	for attempt := 1; attempt <= retries; attempt++ {
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err == nil {
+			if isRetriableStatus(resp.StatusCode) {
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				lastErr = fmt.Errorf("deepface %s — %s", resp.Status, strings.TrimSpace(string(body)))
+			} else {
+				return resp, nil
+			}
+		} else {
+			lastErr = err
+		}
+		if attempt < retries {
+			fmt.Printf("DeepFace retry %d/%d after error: %v\n", attempt, retries, lastErr)
+			time.Sleep(delay)
+		}
+	}
+	return nil, lastErr
 }
 
 func main() {
@@ -164,6 +230,12 @@ func main() {
 		client: &http.Client{Timeout: 30 * time.Second},
 		apiKey: internalAPIKey,
 	}
+	deepfaceTimeout := time.Duration(getEnvInt("DEEPFACE_TIMEOUT_SECONDS", 120)) * time.Second
+	deepfaceRetries := getEnvInt("DEEPFACE_RETRIES", 5)
+	deepfaceRetryDelay := time.Duration(getEnvInt("DEEPFACE_RETRY_DELAY_SECONDS", 5)) * time.Second
+	pixmeRetries := getEnvInt("PIXME_RETRIES", 5)
+	pixmeRetryDelay := time.Duration(getEnvInt("PIXME_RETRY_DELAY_SECONDS", 2)) * time.Second
+	deepfaceClient := &http.Client{Timeout: deepfaceTimeout}
 
 	fmt.Printf("Using DeepFace API at %s\n", deepfaceUri)
 	fmt.Printf("Using Pixme API at %s\n", pixmeUri)
@@ -172,35 +244,21 @@ func main() {
 		fmt.Println("Internal API key configured")
 	}
 
-	// Retry initial connection with backoff — pod networking may not be ready immediately
-	var imageResponse ImageApiResponse
-	var err error
-	for attempt := 1; attempt <= 5; attempt++ {
-		imageResponse, err = getImageList(client, pixmeUri, 0)
-		if err == nil {
-			break
-		}
-		fmt.Printf("Attempt %d/5 failed: %v\n", attempt, err)
-		if attempt < 5 {
-			delay := time.Duration(attempt) * 2 * time.Second
-			fmt.Printf("Retrying in %v...\n", delay)
-			time.Sleep(delay)
-		}
-	}
+	imageResponse, err := getImageListWithRetry(client, pixmeUri, 0, pixmeRetries, pixmeRetryDelay)
 	if err != nil {
-		log.Fatalf("Failed to get initial image list after 5 attempts: %v", err)
+		log.Fatalf("Failed to get initial image list after %d attempts: %v", pixmeRetries, err)
 	}
 
 	offset := 0
 
 	for offset < imageResponse.Total {
-		imageResponse, err := getImageList(client, pixmeUri, offset)
+		imageResponse, err := getImageListWithRetry(client, pixmeUri, offset, pixmeRetries, pixmeRetryDelay)
 		if err != nil {
-			log.Fatalf("Failed to get image list at offset %d: %v", offset, err)
+			log.Fatalf("Failed to get image list at offset %d after %d attempts: %v", offset, pixmeRetries, err)
 		}
 
 		fmt.Printf("Processing batch at offset %d, count %d, total %d\n", offset, imageResponse.Count, imageResponse.Total)
-		count, err := handleImageResponse(imageResponse, client, pixmeUri, deepfaceUri, imageBaseUri)
+		count, err := handleImageResponse(imageResponse, client, deepfaceClient, pixmeUri, deepfaceUri, imageBaseUri, deepfaceRetries, deepfaceRetryDelay)
 		if err != nil {
 			log.Fatalf("Error handling image response at offset %d: %v", offset, err)
 		}
@@ -209,7 +267,7 @@ func main() {
 	fmt.Println("Face recognition job completed successfully")
 }
 
-func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, pixmeUri string, deepfaceUri string, imageBaseUri string) (int, error) {
+func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, deepfaceClient *http.Client, pixmeUri string, deepfaceUri string, imageBaseUri string, deepfaceRetries int, deepfaceRetryDelay time.Duration) (int, error) {
 	if imageResponse.Count != len(imageResponse.Images) {
 		fmt.Printf("Warning: Count %d does not match number of images %d\n", imageResponse.Count, len(imageResponse.Images))
 		return 0, fmt.Errorf("count does not match number of images")
@@ -237,7 +295,7 @@ func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, pi
 		}
 
 		fmt.Printf("Sending request to DeepFace API for image %s uri %s %+v\n", image.Name, deepfaceUri+"/find", deepFaceRequest)
-		resp, err := http.Post(deepfaceUri+"/find", "application/json", io.NopCloser(bytes.NewReader(jsonData)))
+		resp, err := postDeepFaceWithRetry(deepfaceClient, deepfaceUri+"/find", jsonData, deepfaceRetries, deepfaceRetryDelay)
 		if err != nil {
 			return 0, fmt.Errorf("failed to send request to DeepFace API: %s", err)
 		}
