@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 func getEnvWithDefault(key, defaultValue string) string {
@@ -220,6 +223,15 @@ func postDeepFaceWithRetry(client *http.Client, url string, payload []byte, retr
 
 func main() {
 
+	// Initialize OpenTelemetry tracing
+	ctx := context.Background()
+	tp, err := initTracer(ctx, "pixme-facerecognition")
+	if err != nil {
+		fmt.Printf("Warning: Failed to initialize OpenTelemetry tracer: %v\n", err)
+	} else {
+		defer shutdownTracer(tp)
+	}
+
 	// Load configuration from environment variables.
 	deepfaceUri := getEnvWithDefault("DEEPFACE_URI", "http://deepface.pixme.svc.cluster.local:5000")
 	pixmeUri := getEnvWithDefault("PIXME_URI", "http://pixme.pixme.svc.cluster.local:8080")
@@ -227,7 +239,10 @@ func main() {
 	internalAPIKey := getEnvWithDefault("INTERNAL_API_KEY", "")
 
 	client := &pixmeClient{
-		client: &http.Client{Timeout: 30 * time.Second},
+		client: &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: otelhttp.NewTransport(http.DefaultTransport),
+		},
 		apiKey: internalAPIKey,
 	}
 	deepfaceTimeout := time.Duration(getEnvInt("DEEPFACE_TIMEOUT_SECONDS", 120)) * time.Second
@@ -235,7 +250,10 @@ func main() {
 	deepfaceRetryDelay := time.Duration(getEnvInt("DEEPFACE_RETRY_DELAY_SECONDS", 5)) * time.Second
 	pixmeRetries := getEnvInt("PIXME_RETRIES", 5)
 	pixmeRetryDelay := time.Duration(getEnvInt("PIXME_RETRY_DELAY_SECONDS", 2)) * time.Second
-	deepfaceClient := &http.Client{Timeout: deepfaceTimeout}
+	deepfaceClient := &http.Client{
+		Timeout:   deepfaceTimeout,
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
+	}
 
 	fmt.Printf("Using DeepFace API at %s\n", deepfaceUri)
 	fmt.Printf("Using Pixme API at %s\n", pixmeUri)
