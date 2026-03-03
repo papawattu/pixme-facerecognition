@@ -37,6 +37,18 @@ func getEnvInt(key string, defaultValue int) int {
 	return parsed
 }
 
+func getEnvFloat(key string, defaultValue float64) float64 {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return defaultValue
+	}
+	return parsed
+}
+
 // pixmeClient wraps http.Client with the internal API key header for pixme-api requests.
 type pixmeClient struct {
 	client *http.Client
@@ -243,6 +255,7 @@ func main() {
 	modelName := getEnvWithDefault("DEEPFACE_MODEL", "ArcFace")
 	detectorBackend := getEnvWithDefault("DEEPFACE_DETECTOR", "retinaface")
 	distanceMetric := getEnvWithDefault("DEEPFACE_DISTANCE_METRIC", "cosine")
+	maxDistance := getEnvFloat("DEEPFACE_MAX_DISTANCE", 0.40)
 
 	client := &pixmeClient{
 		client: &http.Client{
@@ -264,7 +277,7 @@ func main() {
 	fmt.Printf("Using DeepFace API at %s\n", deepfaceUri)
 	fmt.Printf("Using Pixme API at %s\n", pixmeUri)
 	fmt.Printf("Using Image Base URI at %s\n", imageBaseUri)
-	fmt.Printf("DeepFace model: %s, detector: %s, distance metric: %s\n", modelName, detectorBackend, distanceMetric)
+	fmt.Printf("DeepFace model: %s, detector: %s, distance metric: %s, max distance: %.2f\n", modelName, detectorBackend, distanceMetric, maxDistance)
 	if internalAPIKey != "" {
 		fmt.Println("Internal API key configured")
 	}
@@ -283,7 +296,7 @@ func main() {
 		}
 
 		fmt.Printf("Processing batch at offset %d, count %d, total %d\n", offset, imageResponse.Count, imageResponse.Total)
-		count, err := handleImageResponse(imageResponse, client, deepfaceClient, pixmeUri, deepfaceUri, imageBaseUri, modelName, detectorBackend, distanceMetric, deepfaceRetries, deepfaceRetryDelay)
+		count, err := handleImageResponse(imageResponse, client, deepfaceClient, pixmeUri, deepfaceUri, imageBaseUri, modelName, detectorBackend, distanceMetric, maxDistance, deepfaceRetries, deepfaceRetryDelay)
 		if err != nil {
 			log.Fatalf("Error handling image response at offset %d: %v", offset, err)
 		}
@@ -292,7 +305,7 @@ func main() {
 	fmt.Println("Face recognition job completed successfully")
 }
 
-func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, deepfaceClient *http.Client, pixmeUri string, deepfaceUri string, imageBaseUri string, modelName string, detectorBackend string, distanceMetric string, deepfaceRetries int, deepfaceRetryDelay time.Duration) (int, error) {
+func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, deepfaceClient *http.Client, pixmeUri string, deepfaceUri string, imageBaseUri string, modelName string, detectorBackend string, distanceMetric string, maxDistance float64, deepfaceRetries int, deepfaceRetryDelay time.Duration) (int, error) {
 	if imageResponse.Count != len(imageResponse.Images) {
 		fmt.Printf("Warning: Count %d does not match number of images %d\n", imageResponse.Count, len(imageResponse.Images))
 		return 0, fmt.Errorf("count does not match number of images")
@@ -311,7 +324,7 @@ func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, de
 		deepFaceRequest := DeepFaceRequest{
 			Img:              imageBaseUri + decodedURI,
 			DbPath:           "/mnt/faces",
-			EnforceDetection: false,
+			EnforceDetection: true,
 			ModelName:        modelName,
 			DetectorBackend:  detectorBackend,
 			DistanceMetric:   distanceMetric,
@@ -331,7 +344,13 @@ func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, de
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
-			fmt.Printf("DeepFace API error for image %s: %s — %s\n", image.Name, resp.Status, string(body))
+			if resp.StatusCode == http.StatusBadRequest {
+				// With enforce_detection=true, DeepFace returns 400 when no face
+				// is detected. This is expected for images without people.
+				fmt.Printf("No face detected in image %s, skipping\n", image.Name)
+			} else {
+				fmt.Printf("DeepFace API error for image %s: %s — %s\n", image.Name, resp.Status, string(body))
+			}
 			// Skip this image rather than aborting the whole batch
 			continue
 		}
@@ -345,15 +364,22 @@ func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, de
 		// Track unique people found in this image to avoid duplicate associations.
 		seen := make(map[string]bool)
 
-		// Iterate ALL identity matches, filtering by distance threshold.
+		// Iterate ALL identity matches, filtering by distance and confidence.
 		for key, identity := range deepFaceResponse.Identity {
 			distance, hasDistance := deepFaceResponse.Distance[key]
-			threshold, hasThreshold := deepFaceResponse.Threshold[key]
 
-			// Skip matches that exceed the distance threshold (weak matches).
-			if hasDistance && hasThreshold && distance > threshold {
-				fmt.Printf("Skipping weak match for image %s: identity=%s distance=%.4f threshold=%.4f\n",
-					image.Name, identity, distance, threshold)
+			// Apply strict max distance threshold (overrides DeepFace's default).
+			if hasDistance && distance > maxDistance {
+				fmt.Printf("Skipping match for image %s: identity=%s distance=%.4f exceeds max_distance=%.4f\n",
+					image.Name, identity, distance, maxDistance)
+				continue
+			}
+
+			// Filter on face confidence if available — reject low-confidence detections
+			// which are often false face detections on non-face image regions.
+			if confidence, hasConf := deepFaceResponse.Confidence[key]; hasConf && confidence < 0.90 {
+				fmt.Printf("Skipping low-confidence detection for image %s: identity=%s confidence=%.4f\n",
+					image.Name, identity, confidence)
 				continue
 			}
 
@@ -370,8 +396,8 @@ func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, de
 			seen[name] = true
 
 			if hasDistance {
-				fmt.Printf("Matched identity %s for image %s (distance=%.4f, threshold=%.4f)\n",
-					name, image.Name, distance, threshold)
+				fmt.Printf("Matched identity %s for image %s (distance=%.4f, max=%.4f)\n",
+					name, image.Name, distance, maxDistance)
 			} else {
 				fmt.Printf("Matched identity %s for image %s\n", name, image.Name)
 			}
