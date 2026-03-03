@@ -96,6 +96,9 @@ type DeepFaceRequest struct {
 	Img              string `json:"img"`
 	DbPath           string `json:"db_path"` // This is the path to the image in the database
 	EnforceDetection bool   `json:"enforce_detection"`
+	ModelName        string `json:"model_name"`       // Face recognition model (e.g. ArcFace)
+	DetectorBackend  string `json:"detector_backend"` // Face detector (e.g. retinaface)
+	DistanceMetric   string `json:"distance_metric"`  // Distance metric (e.g. cosine)
 }
 
 type PersonList []PersonDescriptor
@@ -237,6 +240,9 @@ func main() {
 	pixmeUri := getEnvWithDefault("PIXME_URI", "http://pixme.pixme.svc.cluster.local:8080")
 	imageBaseUri := getEnvWithDefault("IMAGE_BASE_URI", "http://pixme-static.pixme.svc.cluster.local:80")
 	internalAPIKey := getEnvWithDefault("INTERNAL_API_KEY", "")
+	modelName := getEnvWithDefault("DEEPFACE_MODEL", "ArcFace")
+	detectorBackend := getEnvWithDefault("DEEPFACE_DETECTOR", "retinaface")
+	distanceMetric := getEnvWithDefault("DEEPFACE_DISTANCE_METRIC", "cosine")
 
 	client := &pixmeClient{
 		client: &http.Client{
@@ -258,6 +264,7 @@ func main() {
 	fmt.Printf("Using DeepFace API at %s\n", deepfaceUri)
 	fmt.Printf("Using Pixme API at %s\n", pixmeUri)
 	fmt.Printf("Using Image Base URI at %s\n", imageBaseUri)
+	fmt.Printf("DeepFace model: %s, detector: %s, distance metric: %s\n", modelName, detectorBackend, distanceMetric)
 	if internalAPIKey != "" {
 		fmt.Println("Internal API key configured")
 	}
@@ -276,7 +283,7 @@ func main() {
 		}
 
 		fmt.Printf("Processing batch at offset %d, count %d, total %d\n", offset, imageResponse.Count, imageResponse.Total)
-		count, err := handleImageResponse(imageResponse, client, deepfaceClient, pixmeUri, deepfaceUri, imageBaseUri, deepfaceRetries, deepfaceRetryDelay)
+		count, err := handleImageResponse(imageResponse, client, deepfaceClient, pixmeUri, deepfaceUri, imageBaseUri, modelName, detectorBackend, distanceMetric, deepfaceRetries, deepfaceRetryDelay)
 		if err != nil {
 			log.Fatalf("Error handling image response at offset %d: %v", offset, err)
 		}
@@ -285,7 +292,7 @@ func main() {
 	fmt.Println("Face recognition job completed successfully")
 }
 
-func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, deepfaceClient *http.Client, pixmeUri string, deepfaceUri string, imageBaseUri string, deepfaceRetries int, deepfaceRetryDelay time.Duration) (int, error) {
+func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, deepfaceClient *http.Client, pixmeUri string, deepfaceUri string, imageBaseUri string, modelName string, detectorBackend string, distanceMetric string, deepfaceRetries int, deepfaceRetryDelay time.Duration) (int, error) {
 	if imageResponse.Count != len(imageResponse.Images) {
 		fmt.Printf("Warning: Count %d does not match number of images %d\n", imageResponse.Count, len(imageResponse.Images))
 		return 0, fmt.Errorf("count does not match number of images")
@@ -305,6 +312,9 @@ func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, de
 			Img:              imageBaseUri + decodedURI,
 			DbPath:           "/mnt/faces",
 			EnforceDetection: false,
+			ModelName:        modelName,
+			DetectorBackend:  detectorBackend,
+			DistanceMetric:   distanceMetric,
 		}
 
 		jsonData, err := json.Marshal(deepFaceRequest)
@@ -331,45 +341,78 @@ func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, de
 		if err := json.NewDecoder(resp.Body).Decode(&deepFaceResponse); err != nil {
 			return 0, fmt.Errorf("failed to decode DeepFace API response: %s", err)
 		}
-		if len(deepFaceResponse.Identity) > 0 {
-			path := deepFaceResponse.Identity["0"]
-			name := extractName(path)
+
+		// Track unique people found in this image to avoid duplicate associations.
+		seen := make(map[string]bool)
+
+		// Iterate ALL identity matches, filtering by distance threshold.
+		for key, identity := range deepFaceResponse.Identity {
+			distance, hasDistance := deepFaceResponse.Distance[key]
+			threshold, hasThreshold := deepFaceResponse.Threshold[key]
+
+			// Skip matches that exceed the distance threshold (weak matches).
+			if hasDistance && hasThreshold && distance > threshold {
+				fmt.Printf("Skipping weak match for image %s: identity=%s distance=%.4f threshold=%.4f\n",
+					image.Name, identity, distance, threshold)
+				continue
+			}
+
+			name := extractName(identity)
 			if name == "" {
-				fmt.Printf("Failed to extract name from path %s\n", path)
-				return 0, fmt.Errorf("failed to extract name from path %s", path)
+				fmt.Printf("Failed to extract name from path %s\n", identity)
+				continue
 			}
 
-			fmt.Printf("Associating identity %s with image %s\n", name, image.Name)
-			assocResp, err := client.Post(pixmeUri+"/api/images/"+image.ID+"/people/"+name, "application/json", nil)
-			if err != nil {
-				fmt.Printf("Failed to associate identity with image %s: %s\n", image.Name, err)
-				return 0, fmt.Errorf("failed to associate identity with image %s: %s", image.Name, err)
+			// Skip duplicate people within the same image.
+			if seen[name] {
+				continue
 			}
-			assocResp.Body.Close()
-			if assocResp.StatusCode != http.StatusNoContent && assocResp.StatusCode != http.StatusOK && assocResp.StatusCode != http.StatusConflict {
-				fmt.Printf("Failed to associate identity with image %s: %s\n", image.Name, assocResp.Status)
-				return 0, fmt.Errorf("failed to associate identity with image %s: %s", image.Name, assocResp.Status)
+			seen[name] = true
+
+			if hasDistance {
+				fmt.Printf("Matched identity %s for image %s (distance=%.4f, threshold=%.4f)\n",
+					name, image.Name, distance, threshold)
+			} else {
+				fmt.Printf("Matched identity %s for image %s\n", name, image.Name)
 			}
 
-			type PersonCreateRequest struct {
-				Name string `json:"name"`
-			}
-			personData, err := json.Marshal(PersonCreateRequest{Name: name})
-			if err != nil {
-				return 0, fmt.Errorf("failed to marshal Person API request: %s", err)
-			}
-			personResp, err := client.Post(pixmeUri+"/api/people/", "application/json", io.NopCloser(bytes.NewReader(personData)))
-			if err != nil {
-				fmt.Printf("Failed to create person %s: %s\n", name, err)
-				return 0, fmt.Errorf("failed to create person %s: %s", name, err)
-			}
-			personResp.Body.Close()
-			if personResp.StatusCode != http.StatusCreated && personResp.StatusCode != http.StatusConflict && personResp.StatusCode != http.StatusOK {
-				fmt.Printf("Failed to create person %s: %s\n", name, personResp.Status)
-				return 0, fmt.Errorf("failed to create person %s: %s", name, personResp.Status)
+			if err := associatePersonWithImage(client, pixmeUri, image, name); err != nil {
+				fmt.Printf("Error associating %s with image %s: %v\n", name, image.Name, err)
+				// Continue processing other matches rather than aborting.
+				continue
 			}
 			fmt.Printf("Successfully associated identity %s with image %s\n", name, image.Name)
 		}
 	}
 	return imageResponse.Count, nil
+}
+
+// associatePersonWithImage calls the pixme API to link a person to an image
+// and ensures the person entity exists.
+func associatePersonWithImage(client *pixmeClient, pixmeUri string, image ImageDescriptor, name string) error {
+	assocResp, err := client.Post(pixmeUri+"/api/images/"+image.ID+"/people/"+name, "application/json", nil)
+	if err != nil {
+		return fmt.Errorf("failed to associate identity: %w", err)
+	}
+	assocResp.Body.Close()
+	if assocResp.StatusCode != http.StatusNoContent && assocResp.StatusCode != http.StatusOK && assocResp.StatusCode != http.StatusConflict {
+		return fmt.Errorf("unexpected status associating identity: %s", assocResp.Status)
+	}
+
+	type PersonCreateRequest struct {
+		Name string `json:"name"`
+	}
+	personData, err := json.Marshal(PersonCreateRequest{Name: name})
+	if err != nil {
+		return fmt.Errorf("failed to marshal Person API request: %w", err)
+	}
+	personResp, err := client.Post(pixmeUri+"/api/people/", "application/json", io.NopCloser(bytes.NewReader(personData)))
+	if err != nil {
+		return fmt.Errorf("failed to create person: %w", err)
+	}
+	personResp.Body.Close()
+	if personResp.StatusCode != http.StatusCreated && personResp.StatusCode != http.StatusConflict && personResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status creating person: %s", personResp.Status)
+	}
+	return nil
 }
