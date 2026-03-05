@@ -17,6 +17,8 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
+var BuildVersion = "dev"
+
 func getEnvWithDefault(key, defaultValue string) string {
 	value := os.Getenv(key)
 	if value == "" {
@@ -237,6 +239,8 @@ func postDeepFaceWithRetry(client *http.Client, url string, payload []byte, retr
 }
 
 func main() {
+
+	fmt.Printf("Starting pixme-facerecognition version %s\n", BuildVersion)
 
 	// Initialize OpenTelemetry tracing
 	ctx := context.Background()
