@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -319,14 +318,8 @@ func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, de
 			fmt.Printf("Warning: Image %s has no URI\n", image.Name)
 			continue
 		}
-		// image.URI comes URL-encoded from the API (e.g. %2Fimages%2F...) — decode it
-		decodedURI, err := url.PathUnescape(image.URI)
-		if err != nil {
-			fmt.Printf("Warning: Failed to decode URI for image %s: %v\n", image.Name, err)
-			decodedURI = image.URI // fallback to raw value
-		}
 		deepFaceRequest := DeepFaceRequest{
-			Img:              imageBaseUri + decodedURI,
+			Img:              imageBaseUri + image.URI,
 			DbPath:           "/mnt/faces",
 			EnforceDetection: true,
 			ModelName:        modelName,
