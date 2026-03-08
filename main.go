@@ -238,7 +238,6 @@ func postDeepFaceWithRetry(client *http.Client, url string, payload []byte, retr
 }
 
 func main() {
-
 	fmt.Printf("Starting pixme-facerecognition version %s\n", BuildVersion)
 
 	// Initialize OpenTelemetry tracing
@@ -250,6 +249,13 @@ func main() {
 		defer shutdownTracer(tp)
 	}
 
+	if err := run(); err != nil {
+		log.Fatalf("Face recognition job failed: %v", err)
+	}
+	fmt.Println("Face recognition job completed successfully")
+}
+
+func run() error {
 	// Load configuration from environment variables.
 	deepfaceUri := getEnvWithDefault("DEEPFACE_URI", "http://deepface.pixme.svc.cluster.local:5000")
 	pixmeUri := getEnvWithDefault("PIXME_URI", "http://pixme.pixme.svc.cluster.local:8080")
@@ -287,7 +293,7 @@ func main() {
 
 	imageResponse, err := getImageListWithRetry(client, pixmeUri, 0, pixmeRetries, pixmeRetryDelay)
 	if err != nil {
-		log.Fatalf("Failed to get initial image list after %d attempts: %v", pixmeRetries, err)
+		return fmt.Errorf("failed to get initial image list after %d attempts: %w", pixmeRetries, err)
 	}
 
 	offset := 0
@@ -295,17 +301,17 @@ func main() {
 	for offset < imageResponse.Total {
 		imageResponse, err := getImageListWithRetry(client, pixmeUri, offset, pixmeRetries, pixmeRetryDelay)
 		if err != nil {
-			log.Fatalf("Failed to get image list at offset %d after %d attempts: %v", offset, pixmeRetries, err)
+			return fmt.Errorf("failed to get image list at offset %d after %d attempts: %w", offset, pixmeRetries, err)
 		}
 
 		fmt.Printf("Processing batch at offset %d, count %d, total %d\n", offset, imageResponse.Count, imageResponse.Total)
 		count, err := handleImageResponse(imageResponse, client, deepfaceClient, pixmeUri, deepfaceUri, imageBaseUri, modelName, detectorBackend, distanceMetric, maxDistance, deepfaceRetries, deepfaceRetryDelay)
 		if err != nil {
-			log.Fatalf("Error handling image response at offset %d: %v", offset, err)
+			return fmt.Errorf("error handling image response at offset %d: %w", offset, err)
 		}
 		offset += count
 	}
-	fmt.Println("Face recognition job completed successfully")
+	return nil
 }
 
 func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, deepfaceClient *http.Client, pixmeUri string, deepfaceUri string, imageBaseUri string, modelName string, detectorBackend string, distanceMetric string, maxDistance float64, deepfaceRetries int, deepfaceRetryDelay time.Duration) (int, error) {
@@ -335,12 +341,13 @@ func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, de
 		fmt.Printf("Sending request to DeepFace API for image %s uri %s %+v\n", image.Name, deepfaceUri+"/find", deepFaceRequest)
 		resp, err := postDeepFaceWithRetry(deepfaceClient, deepfaceUri+"/find", jsonData, deepfaceRetries, deepfaceRetryDelay)
 		if err != nil {
-			return 0, fmt.Errorf("failed to send request to DeepFace API: %s", err)
+			fmt.Printf("Failed to send request to DeepFace API for image %s: %v\n", image.Name, err)
+			continue
 		}
-		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
 			if resp.StatusCode == http.StatusBadRequest {
 				// With enforce_detection=true, DeepFace returns 400 when no face
 				// is detected. This is expected for images without people.
@@ -352,10 +359,13 @@ func handleImageResponse(imageResponse ImageApiResponse, client *pixmeClient, de
 			continue
 		}
 
-		// Do something with the DeepFace API response
+		// Parse the DeepFace API response, then close the body immediately.
 		var deepFaceResponse DeepFaceResponse
-		if err := json.NewDecoder(resp.Body).Decode(&deepFaceResponse); err != nil {
-			return 0, fmt.Errorf("failed to decode DeepFace API response: %s", err)
+		decodeErr := json.NewDecoder(resp.Body).Decode(&deepFaceResponse)
+		resp.Body.Close()
+		if decodeErr != nil {
+			fmt.Printf("Failed to decode DeepFace API response for image %s: %v, skipping\n", image.Name, decodeErr)
+			continue
 		}
 
 		// Track unique people found in this image to avoid duplicate associations.
